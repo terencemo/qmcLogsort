@@ -1,0 +1,159 @@
+#!/usr/bin/perl
+# -*- perl -*-
+# v0.26 -- 2007.05.29 added --from and --to options to facilitate mail tracing
+# v0.25 -- 2006.01.14 made it easier to customize for local config
+# v0.24 -- 2004.07.01 added support for tai64n timestamps
+# v0.23 -- 1999.09.30 added --tell and --seek to speed up searches
+# v0.22 -- 1999.04.11 added support for delivery sorting within messages
+# v0.21 -- 1999.03.29 added //s to match . to newlines in the paragraph ???
+# Authors: Monte Mitzelfelt <monte-qmail-scripts@gonefishing.org>, Terence Monteiro <terence.monteiro@gmail.com>
+
+$version = '0.26' ;
+
+$ENV{COLUMNS} = "200";
+
+use Getopt::Long ;
+BEGIN { eval "require IO::Page" ; }
+
+# USER: Please adjust these three variables as needed for you system
+$DEFLOG = '/var/log/qmail/qmail-send/current';
+
+$TAIDIR = '/usr/local/bin';
+
+%uncompress = (
+	       '.Z'   => 'uncompress -c',
+	       '.gz'  => 'gunzip -c',
+	       '.bz2' => 'bzip2 -dc',
+	      ) ;
+
+$res = GetOptions(
+                   "grep=s", \$grep,
+                   "nogrep=s", \$nogrep,
+                   "follow", \$follow,
+                   "help", \$help,
+                   "tell", \$tell,
+                   "seek=i", \$seek,
+		   "from=s", \$sender,
+		   "to=s", \$rcpt,
+		   "after=s", \$after,
+		   "before=s", \$before,
+                 ) ;
+if ( $res == 0 || $help == 1 ) {
+  print STDERR "\n" if $res == 0 ;
+  ( $0 ) = $0 =~ m!([^/]+)$! ;
+  die <<"USAGE" ;
+  usage: $0
+            [--from pattern]       emit records where sender contains pattern
+            [--to pattern]         emit records where recipient contains pattern
+	    [--after timestamp]		emit records printed before timestamp
+	    [--before timestamp]	emit records printed before timestamp
+            [--grep pattern]       emit records that do contain pattern
+            [--nogrep pattern]     emit records that don't contain pattern
+            [--follow]             follow last log file in list as it grows
+            [--tell]               adds a file position for each record
+            [--seek n]             where n is an integer from tell: line
+            [--help]               this message
+            [file1 ...]            list of files to search
+
+  automatically uncompresses @{[ sort keys %uncompress ]} if systems supports it
+
+version: $version
+
+USAGE
+}
+
+# set autoflush
+$| = 1 ;
+
+@ARGV = ( $DEFLOG )
+   unless @ARGV ;
+
+$zipexts = join "|", map { quotemeta } keys %uncompress ;
+
+@ARGV = map { /($zipexts)$/o ? "$uncompress{$1} $_ |" : $_ } @ARGV ;
+
+# process the tai64n timestamps
+open TAI64N, "|-", "$TAIDIR/tai64nlocal" or die $!;  
+
+FOLLOW:
+while (1) {
+
+  if ( @ARGV > 0 ) {
+    $FILE = shift @ARGV ;
+    open FILE
+     or die "open $FILE: $!\n" ;      
+  }
+
+  if ( defined $seek ) {
+    seek FILE, $seek, 0 ;
+    $lasttell = $seek ;
+  } else {
+    $lasttell = 0 ;
+  }
+
+  while (<FILE>) {
+    # for syslog maillog => next unless / qmail:/ ;
+
+    if ( ( $ts, $type, $msgnum ) = /(@\w+) (\w+) msg (\d+)/ ) {
+      if ( $type eq 'new' ) {
+	$hash{$msgnum}{MSG} = $_ ;
+	$hash{$msgnum}{TELL} = $tellbefore ;
+	$hash{$msgnum}{STIME} = $ts;
+      } elsif ( $type eq 'end' ) {
+      	$hash{$msgnum}{ETIME} = $ts;
+        printmsg( $msgnum, $_ ) ;
+      } else {
+      	$hash{$msgnum}{ETIME} = $ts;
+	$hash{$msgnum}{MSG} .= $_ ;
+      }
+    } elsif ( ($delivery, $msgnum ) = /delivery (\d+): msg (\d+)/ ) {
+      $d2m{$delivery} = $msgnum ;
+      $hash{$msgnum}{ETIME} = $ts;
+      $hash{$msgnum}{MSG} .= $_ ;
+    } elsif ( ( $delivery ) = /delivery (\d+)/ ) {
+      $hash{$msgnum}{ETIME} = $ts;
+      $hash{$d2m{$delivery}}{MSG} .= $_ ;
+    }
+
+    # don't do syscall unless needed
+    $tellbefore = $lasttell ;
+    $lasttell   = tell FILE if $tell ;
+  }
+
+  if ( $follow && @ARGV == 0 ) {
+    # wait three seconds
+    sleep 3 ;
+    # and reset eof!
+    seek FILE, 0, 1 or die "bad seek on FILE: $!\n" ; 
+  } else {
+    close FILE ;
+    while ( ($key,$_) = each %hash ) {
+      printmsg( $key ) ;
+    }
+    undef %hash ;
+    last FOLLOW if @ARGV == 0 ;
+  }
+
+} # while(1)
+close TAI64N ;
+
+sub printmsg {
+  my( $msgnum, $txt, ) = @_ ;
+  my( $delivery, $tellpos, ) ;
+
+  $txt = "$hash{$msgnum}{MSG}$txt" ;
+  $tellpos = $hash{$msgnum}{TELL} ;
+  next if ($before and $hash{$msgnum}{STIME} gt $before);
+  next if ($after and $hash{$msgnum}{ETIME} lt $after);
+
+  delete $hash{$msgnum} ;
+
+  next if $grep && $txt !~ /$grep/sio ;
+
+  next if $sender && $txt !~ /from <$sender>/sio ;
+  next if $rcpt && $txt !~ /to \w+ $rcpt/sio ;
+  
+  next if $nogrep && $txt =~ /$nogrep/sio ;
+ 
+  print TAI64N ( ( $tell ? "tell: $tellpos\n" : ""), "$txt\n" );
+}
